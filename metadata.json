@@ -1,0 +1,5 @@
+{
+  "name": "[ChatCGSAU]",
+  "description": "Protótipo de auditoria em saúde pública federal com análise de documentos, dados tabulares e pesquisa na web via Gemini API.",
+  "requestFramePermissions": []
+}
