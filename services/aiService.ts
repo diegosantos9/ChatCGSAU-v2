@@ -1,26 +1,22 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { searchInContext } from "./dataLoader";
-
-const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
-
-if (!API_KEY) {
-    console.error("VITE_GOOGLE_API_KEY não encontrada!");
-}
-
-const genAI = new GoogleGenerativeAI(API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" }, { dangerouslyAllowBrowser: true });
-
-// Debug de conexão
-try {
-    console.log("Tentando conectar no modelo padrão...");
-} catch (e) {
-    console.error(e);
-}
-
 import { SYSTEM_INSTRUCTION } from "../constants";
+
+// LAZY INITIALIZATION PATTERN
+// Avoids global side-effects during import/deploy
+const getModel = () => {
+    const API_KEY = import.meta.env.VITE_GOOGLE_API_KEY;
+    if (!API_KEY) {
+        throw new Error("API Key (VITE_GOOGLE_API_KEY) not found in environment variables.");
+    }
+    const genAI = new GoogleGenerativeAI(API_KEY);
+    return genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" }, { dangerouslyAllowBrowser: true });
+};
 
 export const sendMessage = async (history: { role: "user" | "model"; parts: { text: string }[] }[], userMessage: string, filters?: { uf?: string, ano?: string, source?: string }) => {
     try {
+        const model = getModel();
+
         // LÓGICA DE CONTINUAÇÃO DE CONVERSA (MEMÓRIA)
         // Se a pergunta for curta (ex: "Resuma") ou de continuação, usamos o contexto da pergunta anterior.
         let queryForSearch = userMessage;
@@ -50,12 +46,6 @@ export const sendMessage = async (history: { role: "user" | "model"; parts: { te
         }
 
         // Injeta o contexto e a instrução do sistema no início da sessão ou na mensagem
-        // Como a API do Gemini não tem um campo "system instruction" separado no método startChat em todas as versões JS SDK de forma simples como no Python, 
-        // ou se tiver, vamos garantir injetando no prompt para robustez.
-        // Mas a melhor prática com o SDK atual é usar systemInstruction na config do model, 
-        // porém o contexto é dinâmico (carregado via fetch).
-        // Então vamos construir o prompt com o contexto injetado na primeira mensagem ou a cada mensagem se for stateless (mas aqui temos history).
-
         // Estratégia: Adicionar o contexto na mensagem atual para garantir que o modelo "veja" os dados.
         let filterInstruction = "";
         if (filters && (filters.uf || filters.ano)) {

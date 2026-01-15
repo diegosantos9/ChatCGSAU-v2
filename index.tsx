@@ -39,10 +39,21 @@ if (!rootElement) {
 }
 
 const root = ReactDOM.createRoot(rootElement);
-root.render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </React.StrictMode>
-);
+try {
+  root.render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </React.StrictMode>
+  );
+} catch (e: any) {
+  console.error("FATAL ERROR DURING MOUNT:", e);
+  document.body.innerHTML = `
+    <div style="color: red; padding: 20px; font-family: sans-serif;">
+      <h1>Erro Fatal de Inicialização</h1>
+      <p>O React não conseguiu montar a aplicação.</p>
+      <pre>${e?.message || e}</pre>
+    </div>
+  `;
+}
