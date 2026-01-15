@@ -1,333 +1,274 @@
-import React, { useState, useEffect } from 'react';
-import { v4 as uuidv4 } from 'uuid';
-import { ChatArea } from './components/ChatArea';
-import { EvidencePanel } from './components/EvidencePanel';
-import { DataPanel } from './components/DataPanel';
-import { AuditCanvas } from './components/AuditCanvas';
-import { redactPII, parseCSV, extractFindings, mockExtractText, calculateScore, extractMetadata, searchAuditDatabase } from './services/dataService';
-import { generateAuditResponse } from './services/geminiService';
-import { ChatMessage, UploadedFile, Finding, AnalysisScore, AuditContext, StructuredFinding, Source, DatabaseResult, SearchDiagnostics } from './types';
-import { DEMO_CSV_GASTOS, DEMO_CSV_PRODUCAO, MOCK_QUESTIONS } from './constants';
+import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { loadData, getSearchFacets } from './services/dataLoader';
+import { sendMessage } from './services/aiService';
+import { SmartResponse } from './components/SmartResponse';
+import { DashboardFilters } from './components/DashboardFilters';
+import './index.css';
+
+interface Message {
+  role: 'user' | 'model';
+  text: string;
+}
+
+const UF_LIST = [
+  'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA',
+  'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN',
+  'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'
+];
+
+const YEAR_LIST = Array.from({ length: 12 }, (_, i) => (new Date().getFullYear() + 1 - i).toString());
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'CANVAS' | 'EVIDENCIAS' | 'DADOS'>('CANVAS');
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [files, setFiles] = useState<UploadedFile[]>([]);
-  const [findings, setFindings] = useState<Finding[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  
-  // State for Canvas Content
-  const [lastAuditSummary, setLastAuditSummary] = useState<string>('');
-  const [lastStructuredFindings, setLastStructuredFindings] = useState<StructuredFinding[]>([]);
-  const [lastWebSources, setLastWebSources] = useState<Source[]>([]);
-  
-  // State for Database Search Results & Diagnostics
-  const [lastDbResults, setLastDbResults] = useState<{ cgu: DatabaseResult[], tcu: DatabaseResult[] }>({ cgu: [], tcu: [] });
-  const [lastDiagnostics, setLastDiagnostics] = useState<SearchDiagnostics | null>(null);
-  const [suggestedTerms, setSuggestedTerms] = useState<string[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSending, setIsSending] = useState(false);
 
-  const [context, setContext] = useState<AuditContext>({
-    uf: '',
-    municipio: '',
-    periodoInicio: '',
-    periodoFim: '',
-    tema: ''
-  });
-  const [score, setScore] = useState<AnalysisScore>({ total: 0, breakdown: { dataQuality: 0, evidenceStrength: 0, webCorroboration: 0 } });
-  
+  // Filter States
+  // Filter States
+  const [availableUFs, setAvailableUFs] = useState<string[]>(UF_LIST);
+  const [availableYears, setAvailableYears] = useState<string[]>(YEAR_LIST);
+  const [lastFacets, setLastFacets] = useState<{ ufs: string[], anos: string[] } | null>(null);
+  const [selectedUF, setSelectedUF] = useState('');
+  const [selectedYear, setSelectedYear] = useState('');
+  const [searchSource, setSearchSource] = useState<'ALL' | 'CGU' | 'TCU' | 'FINDINGS'>('ALL');
+
+  const searchTimeoutRef = useRef<any>(null);
+
   useEffect(() => {
-    setMessages([{
-      id: 'init',
-      role: 'system',
-      content: 'Bem-vindo ao ChatCGSAU. Como Administrador, carregue as planilhas de relatórios (CGU) e acórdãos (TCU) para habilitar a auditoria.',
-      timestamp: new Date()
-    }]);
+    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+
+    if (!input || input.length < 3) {
+      if (lastFacets) {
+        // Restore facets from the last successful search
+        setAvailableUFs(lastFacets.ufs.length > 0 ? lastFacets.ufs : []);
+        setAvailableYears(lastFacets.anos.length > 0 ? lastFacets.anos : []);
+      } else {
+        // Default to all if no search happened yet
+        setAvailableUFs(UF_LIST);
+        setAvailableYears(YEAR_LIST);
+      }
+      return;
+    }
+
+    searchTimeoutRef.current = setTimeout(() => {
+      // Pass current filters for cross-filtering
+      const facets = getSearchFacets(input, { uf: selectedUF || undefined, ano: selectedYear || undefined });
+
+      // Update Facet Lists based on Search Results
+      if (facets.ufs.length > 0) setAvailableUFs(facets.ufs);
+      else setAvailableUFs([]);
+
+      if (facets.anos.length > 0) setAvailableYears(facets.anos);
+      else setAvailableYears([]);
+    }, 400);
+
+    return () => clearTimeout(searchTimeoutRef.current);
+  }, [input, selectedUF, selectedYear]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const initData = async () => {
+      await loadData();
+      setIsLoading(false);
+    };
+    initData();
   }, []);
 
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
   useEffect(() => {
-    const newScore = calculateScore(files, findings, lastWebSources.length);
-    setScore(newScore);
-  }, [files, findings, lastWebSources]);
+    scrollToBottom();
+  }, [messages]);
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const fileList = event.target.files;
-    if (!fileList) return;
+  const handleSend = async () => {
+    if (!input.trim() || isSending) return;
 
-    const newFiles: UploadedFile[] = [];
-    const newFindings: Finding[] = [];
-
-    const processingMsgId = uuidv4();
-    setMessages(prev => [...prev, {
-        id: processingMsgId,
-        role: 'system',
-        content: `Processando ${fileList.length} arquivo(s) (Ingestão + Full Text Indexing)...`,
-        timestamp: new Date()
-    }]);
-
-    for (let i = 0; i < fileList.length; i++) {
-      const file = fileList[i];
-      const id = uuidv4();
-      let type: 'csv' | 'pdf' | 'excel' = 'pdf';
-      
-      if (file.name.endsWith('.csv')) type = 'csv';
-      else if (file.name.endsWith('.xlsx')) type = 'excel';
-
-      const textContent = await mockExtractText(file);
-      const redactedContent = redactPII(textContent);
-      
-      const metadata = extractMetadata(file, textContent);
-
-      let processedData = null;
-      let stats = undefined;
-      let frequentTerms: string[] = [];
-      let detectedSource: 'CGU' | 'TCU' | 'OUTROS' = 'OUTROS';
-
-      if (type === 'csv') {
-        // A & D3: Ingestão gera full_text e termos frequentes
-        const result = parseCSV(redactedContent, file.name);
-        processedData = result.data;
-        stats = result.stats;
-        frequentTerms = result.frequentTerms;
-        detectedSource = result.detectedSource;
-      }
-
-      if (type !== 'csv') {
-        const extracted = extractFindings(redactedContent, file.name);
-        newFindings.push(...extracted);
-      }
-
-      newFiles.push({
-        id,
-        name: file.name,
-        type,
-        size: file.size,
-        content: redactedContent,
-        processedData,
-        stats,
-        metadata,
-        frequentTerms,
-        detectedSource
-      });
-    }
-
-    setFiles(prev => [...prev, ...newFiles]);
-    setFindings(prev => [...prev, ...newFindings]);
-
-    setMessages(prev => prev.map(msg => 
-        msg.id === processingMsgId 
-        ? { ...msg, content: `✅ ${fileList.length} arquivo(s) indexados. Modo Diagnóstico disponível.` }
-        : msg
-    ));
-    
-    setActiveTab('EVIDENCIAS');
-  };
-
-  const loadDemoData = async () => {
-    const gastosFile = new File([DEMO_CSV_GASTOS], "gastos_contratos.csv", { type: "text/csv" });
-    const prodFile = new File([DEMO_CSV_PRODUCAO], "producao_servicos.csv", { type: "text/csv" });
-    const cguContent = `IdTarefa;Titulo;DataPublicacao;UF;UnidadesAuditadas;link
-12345;Relatório de Auditoria SESAI 2023;2023-01-10;DF;SESAI;https://ecgu.cgu.gov.br/relatorio/12345
-67890;Auditoria em Saúde Indígena Yanomami;2023-05-20;RR;DSEI-Y;
-11223;Fiscalização de Contratos de Táxi Aéreo;2022-11-15;AM;DSEI-AM;https://ecgu.cgu.gov.br/relatorio/11223`;
-    const tcuContent = `ACORDAO;TITULO;ASSUNTO;ANO;ENDERECO
-1234/2023;Acórdão 1234/2023 - Plenário;Irregularidades em transporte aéreo na saúde indígena;2023;https://contas.tcu.gov.br/sagas/SvlVisualizarRelVotoAc?codFiltro=SAGAS-SESSAO-ENCERRADA&seOcultaPagina=S&item0=878164
-5678/2022;Acórdão 5678/2022 - Câmara;Auditoria Operacional na SESAI;2022;`;
-
-    const cguFile = new File([cguContent], "base_relatorios_cgu.csv", { type: "text/csv" });
-    const tcuFile = new File([tcuContent], "base_acordaos_tcu.csv", { type: "text/csv" });
-
-    const event = { target: { files: [gastosFile, prodFile, cguFile, tcuFile] } } as unknown as React.ChangeEvent<HTMLInputElement>;
-    await handleFileUpload(event);
-    setContext(prev => ({ ...prev, tema: 'Saúde Indígena', uf: 'DF', municipio: '' }));
-  };
-
-  const handleSendMessage = async (text: string) => {
-    const userMsg: ChatMessage = { id: uuidv4(), role: 'user', content: text, timestamp: new Date() };
+    const userMsg: Message = { role: 'user', text: input };
     setMessages(prev => [...prev, userMsg]);
-    setIsLoading(true);
+    setInput('');
+    setIsSending(true);
 
     try {
-      // 1. Run Enhanced Search (Supports Any Topic + Synonyms)
-      const searchResult = searchAuditDatabase(files, text);
-      
-      setLastDbResults({ cgu: searchResult.cgu, tcu: searchResult.tcu });
-      setLastDiagnostics(searchResult.diagnostics);
-      setSuggestedTerms(searchResult.suggestions);
+      // Converte o histórico para o formato esperado pelo Gemini SDK
+      const historyForApi = messages.map(m => ({
+        role: m.role,
+        parts: [{ text: m.text }]
+      }));
 
-      // 2. Generate AI Response
-      const dbContextStr = `
-        [RELATÓRIOS CGU ENCONTRADOS]: ${JSON.stringify(searchResult.cgu.slice(0, 5))}
-        [ACÓRDÃOS TCU ENCONTRADOS]: ${JSON.stringify(searchResult.tcu.slice(0, 5))}
-        [DIAGNÓSTICO DA BUSCA]: ${JSON.stringify(searchResult.diagnostics)}
-      `;
-
-      const result = await generateAuditResponse(text, files, JSON.stringify(context) + dbContextStr, findings);
-      
-      const webSources = result.groundingMetadata?.groundingChunks?.map((chunk: any) => ({
-            title: chunk.web?.title || 'Fonte Web',
-            uri: chunk.web?.uri || '#',
-            type: 'web'
-      })) || [];
-
-      const botMsg: ChatMessage = {
-        id: uuidv4(),
-        role: 'model',
-        content: result.text || 'Não consegui gerar uma resposta.',
-        timestamp: new Date(),
-        sources: webSources
+      const filters = {
+        uf: selectedUF || undefined,
+        ano: selectedYear || undefined,
+        source: searchSource
       };
 
-      setMessages(prev => [...prev, botMsg]);
-      
-      setLastAuditSummary(result.text || '');
-      setLastStructuredFindings(result.structuredFindings || []);
-      setLastWebSources(webSources);
-      
-      setActiveTab('CANVAS');
+      // Calculate facets for this search to persist them (using current filters)
+      const searchFacets = getSearchFacets(input, filters);
+      setLastFacets(searchFacets);
+      // Also update current view immediately to match what was sent
+      if (searchFacets.ufs.length > 0) setAvailableUFs(searchFacets.ufs);
+      else setAvailableUFs([]);
+
+      if (searchFacets.anos.length > 0) setAvailableYears(searchFacets.anos);
+      else setAvailableYears([]);
+
+      const responseText = await sendMessage(historyForApi, input, filters);
+
+      const aiMsg: Message = { role: 'model', text: responseText };
+      setMessages(prev => [...prev, aiMsg]);
     } catch (error) {
-      console.error(error);
-      setMessages(prev => [...prev, {
-        id: uuidv4(),
-        role: 'model',
-        content: 'Erro ao conectar com o serviço de IA.',
-        timestamp: new Date()
-      }]);
+      console.error("Erro ao enviar mensagem:", error);
+      setMessages(prev => [...prev, { role: 'model', text: "Erro ao comunicar com a IA." }]);
     } finally {
-      setIsLoading(false);
+      setIsSending(false);
     }
   };
 
-  const clearSession = () => {
-    setMessages([]);
-    setFiles([]);
-    setFindings([]);
-    setLastAuditSummary('');
-    setLastStructuredFindings([]);
-    setLastWebSources([]);
-    setLastDbResults({ cgu: [], tcu: [] });
-    setLastDiagnostics(null);
-    setSuggestedTerms([]);
-    setScore({ total: 0, breakdown: { dataQuality: 0, evidenceStrength: 0, webCorroboration: 0 } });
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
   };
 
-  const handleRetrySearch = (term: string) => {
-      setContext(prev => ({ ...prev, tema: term }));
-      handleSendMessage(term);
-  };
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-100">
+        <div className="text-xl font-semibold text-gray-700 animate-pulse">
+          Carregando bases de dados...
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-gray-100">
-      
-      {/* Header */}
-      <header className="bg-slate-800 text-white border-b border-gray-700 p-3 shadow-md z-20">
-        <div className="flex flex-wrap gap-4 items-center justify-between">
-          <div className="flex items-center gap-3">
-             <div className="bg-teal-500 text-white p-1.5 rounded font-bold text-sm tracking-widest">CGSAU</div>
-             <div>
-                <h1 className="text-lg font-bold leading-none">Auditor IA</h1>
-                <span className="text-[10px] text-gray-400 uppercase tracking-wide">Acesso Administrativo</span>
-             </div>
-          </div>
-
-          <div className="flex-1 flex gap-2 mx-4 items-center bg-slate-700/50 p-1.5 rounded-lg border border-slate-600 overflow-x-auto">
-             <span className="text-xs font-semibold text-gray-400 px-2">FILTROS:</span>
-             <input 
-                type="text" 
-                placeholder="Tema" 
-                className="bg-slate-800 border border-slate-600 p-1 rounded text-xs w-32 text-white placeholder-gray-500"
-                value={context.tema}
-                onChange={e => setContext({...context, tema: e.target.value})}
-              />
-             <input 
-                type="text" 
-                placeholder="UF" 
-                className="bg-slate-800 border border-slate-600 p-1 rounded text-xs w-12 text-white placeholder-gray-500"
-                value={context.uf}
-                onChange={e => setContext({...context, uf: e.target.value})}
-              />
-          </div>
-
-          <div className="flex items-center gap-3">
-             <div className="flex gap-2">
-                <button onClick={loadDemoData} className="bg-slate-600 hover:bg-slate-500 text-white px-3 py-1.5 rounded text-xs transition-colors border border-slate-500 hidden md:block">
-                  Simular Carga
-                </button>
-             </div>
-          </div>
-        </div>
+    <div className="flex flex-col h-screen bg-gray-50">
+      <header className="bg-slate-800 text-white p-4 shadow-md">
+        <h1 className="text-xl font-bold">ChatCGSAU Beta</h1>
+        <p className="text-sm opacity-80">Auditor IA conectado às bases CGU e TCU</p>
       </header>
 
-      {/* Main Content Layout */}
-      <main className="flex-1 flex overflow-hidden">
-        
-        {/* Left Side: Chat */}
-        <div className="w-full md:w-[350px] lg:w-[400px] flex-shrink-0 flex flex-col border-r border-gray-200 bg-white z-10 shadow-lg">
-           <div className="p-3 bg-gray-50 border-b border-gray-200">
-              <h2 className="text-xs font-bold text-gray-500 uppercase">Interação Auditor</h2>
-           </div>
-           <ChatArea 
-              messages={messages} 
-              isLoading={isLoading} 
-              onSendMessage={handleSendMessage}
-              onClear={clearSession}
-              onFileUpload={handleFileUpload}
+      <div className="bg-gray-50 pt-4 px-4 pb-2 shrink-0 z-10 border-b border-gray-100">
+        <DashboardFilters selectedSource={searchSource} onSelect={setSearchSource} />
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.length === 0 && (
+          <div className="text-center text-gray-400 mt-10">
+            <p className="text-lg">Olá! Sou o ChatCGSAU.</p>
+            <p>Pergunte sobre auditorias na saúde ou acórdãos do TCU.</p>
+          </div>
+        )}
+
+        {messages.map((msg, idx) => (
+          <div
+            key={idx}
+            className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className={`max-w-[80%] p-3 rounded-lg shadow ${msg.role === 'user'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white text-gray-800 border border-gray-200'
+                }`}
+            >
+              {msg.role === 'model' ? (
+                <SmartResponse text={msg.text} displayFilter={searchSource} />
+              ) : (
+                <div className={`markdown-body ${msg.role === 'user' ? 'text-white' : ''}`}>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      table: ({ node, ...props }) => <div className="overflow-x-auto my-2"><table className="min-w-full divide-y divide-gray-300 border" {...props} /></div>,
+                      thead: ({ node, ...props }) => <thead className="bg-gray-50" {...props} />,
+                      th: ({ node, ...props }) => <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border-b" {...props} />,
+                      td: ({ node, ...props }) => <td className="px-3 py-2 whitespace-normal text-sm border-b" {...props} />,
+                      a: ({ node, ...props }) => <a className="text-blue-500 hover:underline" target="_blank" rel="noopener noreferrer" {...props} />,
+                      ul: ({ node, ...props }) => <ul className="list-disc list-inside ml-4" {...props} />,
+                      ol: ({ node, ...props }) => <ol className="list-decimal list-inside ml-4" {...props} />,
+                      h1: ({ node, ...props }) => <h1 className="text-xl font-bold my-2" {...props} />,
+                      h2: ({ node, ...props }) => <h2 className="text-lg font-bold my-2" {...props} />,
+                      h3: ({ node, ...props }) => <h3 className="text-md font-bold my-1" {...props} />,
+                    }}
+                  >
+                    {msg.text}
+                  </ReactMarkdown>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+        {isSending && (
+          <div className="flex justify-start">
+            <div className="bg-gray-200 p-3 rounded-lg text-gray-500 italic">
+              Digitando...
+            </div>
+          </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="p-4 bg-white border-t border-gray-200 shadow-[0_-2px_10px_rgba(0,0,0,0.05)]">
+        <div className="max-w-4xl mx-auto space-y-3">
+
+          {/* Barra de Filtros */}
+          <div className="flex gap-4 items-center bg-gray-50 p-2 rounded-lg border border-gray-100">
+            <span className="text-xs font-semibold text-gray-500 uppercase ml-2">Filtros de Contexto:</span>
+
+            <div className="flex items-center gap-2">
+              <label htmlFor="uf-select" className="text-sm text-gray-600">UF:</label>
+              <select
+                id="uf-select"
+                value={selectedUF}
+                onChange={(e) => setSelectedUF(e.target.value)}
+                className="text-sm p-1.5 border border-gray-300 rounded focus:outline-none focus:border-blue-500 bg-white"
+              >
+                <option value="">Todas</option>
+                {availableUFs.map(uf => (
+                  <option key={uf} value={uf}>{uf}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <label htmlFor="year-select" className="text-sm text-gray-600">Ano:</label>
+              <select
+                id="year-select"
+                value={selectedYear}
+                onChange={(e) => setSelectedYear(e.target.value)}
+                className="text-sm p-1.5 border border-gray-300 rounded focus:outline-none focus:border-blue-500 bg-white"
+              >
+                <option value="">Todos</option>
+                {availableYears.map(year => (
+                  <option key={year} value={year}>{year}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="flex gap-2">
+            <input
+              type="text"
+              className="flex-1 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 shadow-sm"
+              placeholder="Digite sua pergunta..."
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              disabled={isSending}
             />
-        </div>
-
-        {/* Right Side: The Canvas (Main View) */}
-        <div className="flex-1 flex flex-col bg-slate-100 min-w-0">
-          <div className="flex border-b border-gray-200 bg-white px-4">
             <button
-              onClick={() => setActiveTab('CANVAS')}
-              className={`py-3 px-6 text-sm font-bold border-b-2 transition-colors flex items-center gap-2 ${
-                activeTab === 'CANVAS' 
-                  ? 'border-indigo-600 text-indigo-700' 
-                  : 'border-transparent text-gray-500 hover:text-gray-700'
-              }`}
+              onClick={handleSend}
+              disabled={isSending || !input.trim()}
+              className="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium shadow-sm"
             >
-              Painel de Auditoria
-            </button>
-            <button
-              onClick={() => setActiveTab('EVIDENCIAS')}
-              className={`py-3 px-6 text-sm font-medium border-b-2 transition-colors ${
-                activeTab === 'EVIDENCIAS' 
-                  ? 'border-teal-600 text-teal-700' 
-                  : 'border-transparent text-gray-500 hover:text-gray-700'
-              }`}
-            >
-              Arquivos ({files.length})
+              Enviar
             </button>
           </div>
-
-          <div className="flex-1 overflow-hidden relative">
-            {activeTab === 'CANVAS' && (
-              <AuditCanvas 
-                sintese={lastAuditSummary} 
-                structuredFindings={lastStructuredFindings} 
-                files={files} 
-                dbResults={lastDbResults}
-                webSources={lastWebSources}
-                isLoading={isLoading}
-                diagnostics={lastDiagnostics}
-                suggestedTerms={suggestedTerms}
-                onRetrySearch={handleRetrySearch}
-              />
-            )}
-            
-            {activeTab === 'EVIDENCIAS' && (
-              <EvidencePanel files={files} findings={findings} score={score} />
-            )}
-            
-            {activeTab === 'DADOS' && (
-              <DataPanel files={files} />
-            )}
-          </div>
         </div>
-      </main>
-      
-      <footer className="bg-slate-900 border-t border-slate-800 p-1 text-center text-[10px] text-gray-500">
-        ChatCGSAU - Ambiente Seguro. Dados mascarados. Busca Full-Text Habilitada.
-      </footer>
+      </div>
     </div>
   );
 }
